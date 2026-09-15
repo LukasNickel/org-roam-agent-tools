@@ -1,0 +1,232 @@
+#+title: Org-roam agent tools
+
+* Purpose
+
+These tools provide a small interface between an agent and the configured
+Org-roam instance. Retrieval operations are read-only. Capture operations open
+an interactive capture and require the user to finalize it. The Emacs Lisp
+helper is loaded into the running Emacs server, so the user's existing
+Org-roam directory, templates, and database settings remain authoritative.
+
+* Search nodes
+
+#+begin_src sh
+org-roam-agent search-nodes --query "authentication" --limit 20
+#+end_src
+
+The search is case-insensitive. Every whitespace-separated query term must
+occur in the node title, an alias, or a tag. Exact and title matches are ranked
+first. The result is JSON containing the query, result counts, a truncation
+flag, and node records with these fields:
+
+- =id=
+- =title=
+- =aliases=
+- =tags=
+- =file=
+- =level=
+
+The command requires a running Emacs server with Org-roam available. It only
+reads the current Org-roam database: it does not save buffers, synchronize the
+database, or modify notes.
+
+* Search note text
+
+#+begin_src sh
+org-roam-agent search-text --query "python package" --limit 50
+org-roam-agent search-text \
+  --query "pip|pyproject|setuptools" \
+  --regex \
+  --limit 50
+#+end_src
+
+Literal, case-insensitive search is the default. The explicit =--regex= flag
+enables ripgrep regular-expression syntax.
+
+The command asks the running Emacs instance for its normalized
+=org-roam-directory=, then runs ripgrep directly beneath that directory. Build
+directories, attachments, and attachment-cleanup quarantine directories are
+excluded.
+Results contain a relative file path, line number, and matching line. Both the
+number of results and the length of each returned line are bounded. A
+=truncated= value of =true= means more matching lines exist.
+
+Pass promising =file= and =line= values to the =context= command.
+
+* Read context
+
+#+begin_src sh
+org-roam-agent context \
+  --file standard/2024/20241008142242-remote_pyvista.org \
+  --line 54
+#+end_src
+
+This returns the nearest enclosing Org heading and subtree, its outline path,
+and the owning Org-roam node. The excerpt is limited to 4000 characters by
+default; use =--max-chars= to select a limit up to 50000. The result reports
+both the complete subtree's line range and the excerpt's line range.
+
+Relative paths resolve against the configured =org-roam-directory=. Files
+outside that directory and non-Org files are rejected.
+
+When the file is already open in Emacs, the command reads its current buffer
+contents, including unsaved changes, without saving or modifying the buffer.
+The =source= and =buffer_modified= result fields make this explicit. Otherwise
+the command reads the file from disk.
+
+* Inspect direct links
+
+#+begin_src sh
+org-roam-agent links \
+  --id "4d574599-c3a3-4c36-b921-c99aabfe00d2" \
+  --limit 50
+#+end_src
+
+This reads direct Org-roam =id:= links for one stable node ID. Results are
+grouped into =backlinks=, whose source nodes link to the selected node, and
+=outgoing= links from the selected node. Each direction is independently
+bounded and reports =returned= and =truncated=.
+
+Each resolved neighbor contains its ID, title, file, level, occurrence count,
+and a representative =link_file= and =link_line=. For a backlink, the link is
+in the neighbor's file; for an outgoing link, it is in the selected node's
+file. Use that location with =context= when the relationship itself needs to
+be inspected.
+
+Only resolved Org-roam =id:= links are returned. External URLs, citations, and
+unresolved IDs are outside this command's scope. The result comes from the
+Org-roam database and sets =database_may_omit_unsaved= to make clear that
+unsaved buffer changes may not be represented. The command neither saves
+buffers nor rebuilds the database.
+
+* Capture capabilities
+
+#+begin_src sh
+org-roam-agent capabilities
+#+end_src
+
+This reports the default template, supported capture modes, whether
+finalization is interactive, and a stable record for each configured template:
+
+- =key=, selection =description=, and whether it is the =default=;
+- =purpose= from the optional =org-roam-agent-template-metadata= configuration;
+- =capture_type=;
+- structured =target= type and destination;
+- =initial_content= source, availability, and a preview bounded to 4000
+  characters.
+
+Define agent-facing purposes alongside the Org-roam configuration, keyed by
+the same template key:
+
+#+begin_src emacs-lisp
+(setq org-roam-agent-template-metadata
+      '(("s" :purpose "Ordinary standalone knowledge notes")
+        ("e" :purpose "Notes specifically about Emacs")))
+#+end_src
+
+Templates without configured metadata return =purpose: null= rather than an
+inferred meaning. Function-backed initial content is identified but is not
+executed merely to report capabilities. Missing template files are reported as
+unavailable. The command does not modify Emacs or the notes.
+
+* Prepare a new file node
+
+Write the proposed new text to a temporary body file, then run:
+
+#+begin_src sh
+org-roam-agent prepare-capture \
+  --title "Capture design" \
+  --section-title "Observation" \
+  --body-file /tmp/org-roam-agent-draft.org \
+  --template s
+#+end_src
+
+The command clones the selected configured template in memory and appends a
+new section of this form:
+
+#+begin_example
+* Observation :agent:
+:PROPERTIES:
+:SOURCE_SESSION: [[file:/path/to/transcript.md][agent-shell session ...]]
+:END:
+
+Draft text
+#+end_example
+
+The configured template continues to control the new file's directory,
+filename, and header. The command does not change the configured template.
+
+* Prepare a child heading node
+
+To add new content beneath an existing Org-roam node, identify the parent by
+its stable ID:
+
+#+begin_src sh
+org-roam-agent prepare-capture \
+  --title "New observation" \
+  --body-file /tmp/org-roam-agent-draft.org \
+  --parent-id "PARENT-NODE-ID"
+#+end_src
+
+The new child heading receives its own ID, the =:agent:= tag, and the same
+=SOURCE_SESSION= provenance. Existing content is not rewritten. To avoid
+saving unrelated edits when the user finalizes the capture, the command
+rejects a parent file that already has unsaved buffer changes. The
+=--section-title= and =--template= options are not used for child nodes.
+
+Both capture modes return a JSON result with status =prepared= and a
+=request_id=, then open the ordinary Org capture UI. Finalize with =C-c C-c=
+or abort with =C-c C-k=. A prepared result does not mean the node has been
+saved.
+
+Query the request after the user finishes interacting with the capture:
+
+#+begin_src sh
+org-roam-agent capture-status --request-id "REQUEST-ID"
+#+end_src
+
+The status changes from =prepared= to =finalized= after Org successfully saves
+the capture, or to =aborted= when the user aborts it. Lifecycle records live in
+the running Emacs instance and are limited to the 100 most recently prepared
+requests. An unknown request may have expired or belong to a previous Emacs
+instance; do not infer its outcome.
+
+The session ID must identify exactly one agent-shell transcript. It defaults
+to =CODEX_SESSION_ID= when that environment variable is present, so
+=--session-id= should normally be omitted. Concurrent agent-shell sessions
+with different IDs do not conflict: only the matching active transcript is
+considered, with stored transcripts used when no matching active buffer exists.
+
+If the environment ID is unavailable, pass =--session-id= explicitly. If a
+resumed or crashed session leaves more than one matching transcript, select
+the intended one explicitly:
+
+#+begin_src sh
+org-roam-agent prepare-capture \
+  --title "Capture design" \
+  --section-title "Observation" \
+  --body-file /tmp/org-roam-agent-draft.org \
+  --template s \
+  --session-id "SESSION-ID" \
+  --transcript-file ".agent-shell/transcripts/TRANSCRIPT.md"
+#+end_src
+
+Relative transcript paths are made absolute against the directory from which
+the command is invoked. An explicit file is accepted only when its real path
+is beneath an =.agent-shell/transcripts= directory and its header contains the
+requested session ID. The transcript may be in the Org tree or an unrelated
+project. Automatic resolution remains the normal path. External transcripts
+are linked in place and are not copied into the Org tree. The capture body is
+limited to 100,000 characters.
+
+* Connection
+
+All commands require a running Emacs server. Full-text search obtains the
+configured Org-roam root from Emacs; the other commands access the Org-roam
+database, live buffer contents, or capture UI.
+
+Set =ORG_ROAM_AGENT_SOCKET= when the configured Emacs server does not use the
+default socket name. Set =ORG_ROAM_AGENT_EMACSCLIENT= to select a different
+=emacsclient= executable. The wrapper uses =python3= to decode the value
+returned by =emacsclient= without creating temporary files; set
+=ORG_ROAM_AGENT_PYTHON= to select another Python executable.

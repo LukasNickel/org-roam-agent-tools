@@ -1,0 +1,423 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+readonly program_name="${0##*/}"
+readonly default_limit=20
+readonly maximum_limit=100
+readonly default_text_limit=50
+readonly maximum_text_limit=500
+readonly default_link_limit=50
+readonly maximum_link_limit=100
+
+usage() {
+  cat <<EOF
+Usage:
+  $program_name search-nodes --query QUERY [--limit LIMIT]
+  $program_name search-text --query QUERY [--regex] [--limit LIMIT]
+  $program_name context --file FILE --line LINE [--max-chars CHARACTERS]
+  $program_name links --id NODE_ID [--limit LIMIT]
+  $program_name capabilities
+  $program_name capture-status --request-id REQUEST_ID
+  $program_name prepare-capture --title TITLE --body-file FILE
+    [--section-title TITLE] [--template KEY] [--session-id ID]
+    [--transcript-file FILE] [--parent-id ID]
+
+Search the configured Org-roam database by node title, alias, and tag.
+Results are emitted as JSON. LIMIT defaults to $default_limit and may not
+exceed $maximum_limit.
+
+Search Org file contents. Queries are case-insensitive fixed strings by
+default; --regex enables regular-expression syntax. LIMIT defaults to
+$default_text_limit and may not exceed $maximum_text_limit.
+
+Return the Org subtree containing LINE in FILE, including its outline path,
+owning Org-roam node, and a bounded excerpt. Relative paths resolve against
+the configured Org-roam directory. CHARACTERS defaults to 4000 and may not
+exceed 50000.
+
+Return resolved Org-roam ID links for NODE_ID, separated into backlinks and
+outgoing links. LIMIT defaults to $default_link_limit and may not exceed
+$maximum_link_limit per direction.
+
+Report configured capture templates, or prepare an interactive Org capture.
+Query a prepared capture by request ID to determine whether it remains open,
+was finalized, or was aborted. Capture status is kept in the running Emacs
+instance and is bounded to the most recent requests.
+
+Without --parent-id, a new file node is prepared and --section-title is
+required. With --parent-id, a new child heading node is prepared beneath that
+Org-roam node and TITLE is used as its heading. Captures are never finalized
+automatically. --session-id defaults to CODEX_SESSION_ID when available.
+--transcript-file selects a matching transcript explicitly when automatic
+session lookup is ambiguous. Relative transcript paths resolve against the
+directory from which this command is invoked.
+
+Environment:
+  ORG_ROAM_AGENT_EMACSCLIENT  emacsclient executable (default: emacsclient)
+  ORG_ROAM_AGENT_SOCKET       optional Emacs server socket name
+  ORG_ROAM_AGENT_PYTHON       Python executable (default: python3)
+EOF
+}
+
+fail() {
+  printf '%s: %s\n' "$program_name" "$1" >&2
+  exit 2
+}
+
+encode_base64() {
+  printf '%s' "$1" | base64 | tr -d '\n'
+}
+
+[[ $# -gt 0 ]] || {
+  usage >&2
+  exit 2
+}
+
+readonly command="$1"
+shift
+
+query=""
+limit="$default_limit"
+text_limit="$default_text_limit"
+regexp="nil"
+file=""
+line=""
+max_characters=4000
+title=""
+section_title=""
+body_file=""
+session_id="${CODEX_SESSION_ID:-}"
+template="s"
+parent_id=""
+request_id=""
+transcript_file=""
+node_id=""
+link_limit="$default_link_limit"
+
+case "$command" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  search-nodes)
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --query)
+          [[ $# -ge 2 ]] || fail "--query requires a value"
+          query="$2"
+          shift 2
+          ;;
+        --limit)
+          [[ $# -ge 2 ]] || fail "--limit requires a value"
+          limit="$2"
+          shift 2
+          ;;
+        -h|--help)
+          usage
+          exit 0
+          ;;
+        *)
+          fail "unknown argument: $1"
+          ;;
+      esac
+    done
+
+    [[ -n "$query" ]] || fail "--query must not be empty"
+    [[ "$limit" =~ ^[0-9]+$ ]] || fail "--limit must be an integer"
+    (( limit >= 1 && limit <= maximum_limit )) || \
+      fail "--limit must be between 1 and $maximum_limit"
+
+    readonly query_base64="$(encode_base64 "$query")"
+    eval_body="(org-roam-agent-search-nodes-json
+      (base64-decode-string \"$query_base64\")
+      $limit)"
+    ;;
+  search-text)
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --query)
+          [[ $# -ge 2 ]] || fail "--query requires a value"
+          query="$2"
+          shift 2
+          ;;
+        --regex)
+          regexp="t"
+          shift
+          ;;
+        --limit)
+          [[ $# -ge 2 ]] || fail "--limit requires a value"
+          text_limit="$2"
+          shift 2
+          ;;
+        -h|--help)
+          usage
+          exit 0
+          ;;
+        *)
+          fail "unknown argument: $1"
+          ;;
+      esac
+    done
+
+    [[ -n "$query" ]] || fail "--query must not be empty"
+    [[ "$text_limit" =~ ^[0-9]+$ ]] || fail "--limit must be an integer"
+    (( text_limit >= 1 && text_limit <= maximum_text_limit )) || \
+      fail "--limit must be between 1 and $maximum_text_limit"
+
+    eval_body="(org-roam-agent-root-directory)"
+    ;;
+  context)
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --file)
+          [[ $# -ge 2 ]] || fail "--file requires a value"
+          file="$2"
+          shift 2
+          ;;
+        --line)
+          [[ $# -ge 2 ]] || fail "--line requires a value"
+          line="$2"
+          shift 2
+          ;;
+        --max-chars)
+          [[ $# -ge 2 ]] || fail "--max-chars requires a value"
+          max_characters="$2"
+          shift 2
+          ;;
+        -h|--help)
+          usage
+          exit 0
+          ;;
+        *)
+          fail "unknown argument: $1"
+          ;;
+      esac
+    done
+
+    [[ -n "$file" ]] || fail "--file must not be empty"
+    [[ "$line" =~ ^[0-9]+$ ]] || fail "--line must be a positive integer"
+    (( line >= 1 )) || fail "--line must be a positive integer"
+    [[ "$max_characters" =~ ^[0-9]+$ ]] || \
+      fail "--max-chars must be an integer"
+    (( max_characters >= 1 && max_characters <= 50000 )) || \
+      fail "--max-chars must be between 1 and 50000"
+
+    readonly file_base64="$(encode_base64 "$file")"
+    eval_body="(org-roam-agent-context-json
+      (base64-decode-string \"$file_base64\")
+      $line
+      $max_characters)"
+    ;;
+  links)
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --id)
+          [[ $# -ge 2 ]] || fail "--id requires a value"
+          node_id="$2"
+          shift 2
+          ;;
+        --limit)
+          [[ $# -ge 2 ]] || fail "--limit requires a value"
+          link_limit="$2"
+          shift 2
+          ;;
+        -h|--help)
+          usage
+          exit 0
+          ;;
+        *)
+          fail "unknown argument: $1"
+          ;;
+      esac
+    done
+
+    [[ -n "$node_id" ]] || fail "--id must not be empty"
+    [[ "$link_limit" =~ ^[0-9]+$ ]] || fail "--limit must be an integer"
+    (( link_limit >= 1 && link_limit <= maximum_link_limit )) || \
+      fail "--limit must be between 1 and $maximum_link_limit"
+
+    readonly node_id_base64="$(encode_base64 "$node_id")"
+    eval_body="(org-roam-agent-links-json
+      (base64-decode-string \"$node_id_base64\")
+      $link_limit)"
+    ;;
+  capabilities)
+    [[ $# -eq 0 ]] || fail "capabilities accepts no arguments"
+    eval_body="(org-roam-agent-capabilities-json)"
+    ;;
+  capture-status)
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --request-id)
+          [[ $# -ge 2 ]] || fail "--request-id requires a value"
+          request_id="$2"
+          shift 2
+          ;;
+        -h|--help)
+          usage
+          exit 0
+          ;;
+        *)
+          fail "unknown argument: $1"
+          ;;
+      esac
+    done
+
+    [[ -n "$request_id" ]] || fail "--request-id must not be empty"
+    readonly request_id_base64="$(encode_base64 "$request_id")"
+    eval_body="(org-roam-agent-capture-status-json
+      (base64-decode-string \"$request_id_base64\"))"
+    ;;
+  prepare-capture)
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --title)
+          [[ $# -ge 2 ]] || fail "--title requires a value"
+          title="$2"
+          shift 2
+          ;;
+        --section-title)
+          [[ $# -ge 2 ]] || fail "--section-title requires a value"
+          section_title="$2"
+          shift 2
+          ;;
+        --body-file)
+          [[ $# -ge 2 ]] || fail "--body-file requires a value"
+          body_file="$2"
+          shift 2
+          ;;
+        --template)
+          [[ $# -ge 2 ]] || fail "--template requires a value"
+          template="$2"
+          shift 2
+          ;;
+        --session-id)
+          [[ $# -ge 2 ]] || fail "--session-id requires a value"
+          session_id="$2"
+          shift 2
+          ;;
+        --transcript-file)
+          [[ $# -ge 2 ]] || fail "--transcript-file requires a value"
+          transcript_file="$2"
+          shift 2
+          ;;
+        --parent-id)
+          [[ $# -ge 2 ]] || fail "--parent-id requires a value"
+          parent_id="$2"
+          shift 2
+          ;;
+        -h|--help)
+          usage
+          exit 0
+          ;;
+        *)
+          fail "unknown argument: $1"
+          ;;
+      esac
+    done
+
+    [[ -n "$title" ]] || fail "--title must not be empty"
+    [[ -n "$body_file" ]] || fail "--body-file must not be empty"
+    [[ -f "$body_file" ]] || fail "body file is not a regular file: $body_file"
+    [[ -r "$body_file" ]] || fail "body file is not readable: $body_file"
+    [[ -n "$session_id" ]] || \
+      fail "--session-id is required when CODEX_SESSION_ID is unset"
+    if [[ -z "$parent_id" && -z "$section_title" ]]; then
+      fail "--section-title is required when creating a new file node"
+    fi
+    if [[ -n "$transcript_file" ]]; then
+      [[ -f "$transcript_file" ]] || \
+        fail "transcript file is not a regular file: $transcript_file"
+      transcript_file="$(realpath -- "$transcript_file")"
+    fi
+
+    readonly title_base64="$(encode_base64 "$title")"
+    readonly section_title_base64="$(encode_base64 "$section_title")"
+    readonly body_file_base64="$(encode_base64 "$body_file")"
+    readonly session_id_base64="$(encode_base64 "$session_id")"
+    readonly template_base64="$(encode_base64 "$template")"
+    readonly parent_id_base64="$(encode_base64 "$parent_id")"
+    readonly transcript_file_base64="$(encode_base64 "$transcript_file")"
+    readonly invocation_directory_base64="$(encode_base64 "$(pwd -P)")"
+    eval_body="(let ((parent-id
+                       (base64-decode-string \"$parent_id_base64\"))
+                     (transcript-file
+                       (base64-decode-string \"$transcript_file_base64\")))
+      (org-roam-agent-prepare-capture-json
+       (base64-decode-string \"$title_base64\")
+       (base64-decode-string \"$section_title_base64\")
+       (base64-decode-string \"$body_file_base64\")
+       (base64-decode-string \"$session_id_base64\")
+       (base64-decode-string \"$template_base64\")
+       (unless (string-empty-p parent-id) parent-id)
+       (unless (string-empty-p transcript-file) transcript-file)
+       (base64-decode-string \"$invocation_directory_base64\")))"
+    ;;
+    *)
+      fail "unknown command: $command"
+      ;;
+  esac
+
+readonly script_path="$(realpath -- "${BASH_SOURCE[0]}")"
+readonly script_dir="$(CDPATH= cd -- "$(dirname -- "$script_path")" && pwd)"
+readonly helper_file="$script_dir/org-roam-agent.el"
+readonly text_search_helper="$script_dir/org-roam-agent-search-text.py"
+readonly emacsclient_command="${ORG_ROAM_AGENT_EMACSCLIENT:-emacsclient}"
+readonly python_command="${ORG_ROAM_AGENT_PYTHON:-python3}"
+
+command -v "$python_command" >/dev/null 2>&1 || \
+  fail "Python executable not found: $python_command"
+
+[[ -f "$helper_file" ]] || fail "missing Elisp helper: $helper_file"
+command -v "$emacsclient_command" >/dev/null 2>&1 || \
+  fail "emacsclient executable not found: $emacsclient_command"
+
+readonly helper_base64="$(encode_base64 "$helper_file")"
+readonly eval_form="(progn
+  (load (base64-decode-string \"$helper_base64\") nil nil t)
+  $eval_body)"
+
+client_args=()
+if [[ -n "${ORG_ROAM_AGENT_SOCKET:-}" ]]; then
+  client_args+=(--socket-name "$ORG_ROAM_AGENT_SOCKET")
+fi
+
+if ! encoded_result="$("$emacsclient_command" "${client_args[@]}" --eval "$eval_form")"; then
+  fail "could not query the configured Emacs server"
+fi
+
+if ! decoded_result="$(printf '%s\n' "$encoded_result" | "$python_command" -c '
+import json
+import sys
+
+try:
+    result = json.loads(sys.stdin.read())
+except (TypeError, ValueError) as error:
+    print(f"could not decode Emacs response: {error}", file=sys.stderr)
+    raise SystemExit(1)
+
+if not isinstance(result, str):
+    print("Emacs response was not a JSON string", file=sys.stderr)
+    raise SystemExit(1)
+
+sys.stdout.write(result)
+')"; then
+  fail "Emacs returned an invalid result"
+fi
+
+if [[ "$command" == "search-text" ]]; then
+  [[ -f "$text_search_helper" ]] || \
+    fail "missing full-text search helper: $text_search_helper"
+  text_search_args=(
+    --root "$decoded_result"
+    --query "$query"
+    --limit "$text_limit"
+  )
+  if [[ "$regexp" == "t" ]]; then
+    text_search_args+=(--regex)
+  fi
+  exec "$python_command" "$text_search_helper" "${text_search_args[@]}"
+fi
+
+printf '%s\n' "$decoded_result"
