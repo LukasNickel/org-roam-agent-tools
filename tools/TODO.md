@@ -1,7 +1,8 @@
 # Org-roam agent tools backlog
 
-The current capture workflow is usable when Agent Shell runs inside the Org
-project. These are hardening and portability improvements.
+The capture and lookup workflows are usable from unrelated Agent Shell
+projects through globally discovered skills and a separately installed runtime.
+The remaining items are optional provenance and data-model improvements.
 
 ## Capture lifecycle
 
@@ -36,19 +37,29 @@ project. These are hardening and portability improvements.
   - Document the standard template's destination, file header, and intended use
     for ordinary knowledge notes.
   - Document when each non-standard template should be selected.
-  - Consider returning a stable summary of these details from `capabilities`
-    instead of only the template key and short description.
+  - Return a stable summary of these details from `capabilities` instead of
+    only the template key and short description.
 
 ## Sandbox integration
 
-- [ ] Document and streamline access to the running Emacs server from a
+- [x] Document and streamline access to the running Emacs server from a
   sandboxed agent session.
   - Treat `Operation not permitted` while connecting to an existing Emacs
     socket as a sandbox restriction, not evidence that Emacs is stopped.
-  - Investigate a least-privilege permission profile that allows only the
-    configured Emacs Unix socket.
-  - If configuration is unavailable, retry the unchanged helper command with
-    explicit approval rather than probing or changing Emacs.
+  - Do not allowlist the Emacs Unix socket: socket access is process-wide and
+    `emacsclient --eval` would expose arbitrary Emacs Lisp execution.
+  - Copy the privileged runtime into =~/.local/libexec/org-roam-agent/v1=
+    instead of linking it to an agent-writable checkout.
+  - Use an exact command-prefix rule for the installed executable and its
+    supported subcommands; use per-invocation prompts while developing.
+  - Treat this command-rule integration as Codex-specific; other agent hosts
+    need an equivalent least-privilege execution mechanism.
+  - Have both skills invoke the exact absolute path returned by =command -v=
+    so the rule matches predictably.
+  - Have both skills request outside-sandbox execution from the outset rather
+    than first making a socket request that is expected to fail.
+  - Treat a remaining permission error as a host-configuration problem rather
+    than probing the socket or changing Emacs.
 
 ## Cross-project capture and installation
 
@@ -60,8 +71,17 @@ project. These are hardening and portability improvements.
   - Extend explicit fallback validation to external project transcripts without
     accepting arbitrary files: require an =.agent-shell/transcripts= location
     and a header matching the requested session ID.
-  - External transcripts remain linked in place; durable archival can be added
-    later as an explicit operation.
+  - Snapshot external transcripts into the synchronized Org tree instead of
+    leaving device-local links in permanent notes.
+
+- [x] Archive capture provenance portably on successful finalization.
+  - Stage an immutable transcript snapshot when preparing the capture.
+  - Insert the final relative link before presenting the capture buffer.
+  - Materialize the content-addressed snapshot beneath
+    =provenance/agent-shell= before Org saves the finalized note.
+  - Abort without leaving an archived snapshot, and prevent saving the note if
+    archival fails.
+  - Deduplicate identical snapshots for the same session and year.
 
 - [ ] Investigate an on-demand conversation export when no Agent Shell
   transcript exists.
@@ -72,10 +92,13 @@ project. These are hardening and portability improvements.
 
 - [x] Make the helper tools discoverable independently of the current project's
   Git root.
-  - Install the command into =~/.local/bin= and the skills beneath
-    =~/.agents/skills= using symlinks documented in the project README.
+  - Copy the runtime into the versioned
+    =~/.local/libexec/org-roam-agent/v1= directory and link its command from
+    =~/.local/bin=.
+  - Link the skills beneath =~/.agents/skills= so skill development remains
+    live without making the privileged runtime agent-writable.
   - The global capture and lookup skills resolve the installed command from
-    =PATH=.
+    =PATH= and then use the returned absolute path.
   - Retain a convenient development path for editing and testing the tools in
     this repository without making other projects depend on its layout.
 
@@ -91,8 +114,7 @@ project. These are hardening and portability improvements.
 
 ## Compiled Elisp
 
-- [ ] Remove the unused stale `org-roam-agent.elc` and document how compiled
-  artifacts are handled.
-  - Add an ignore rule if byte-compiled files should remain local build output.
-  - Continue loading the source `.el` explicitly unless an intentional build or
-    installation step is introduced.
+- [x] Keep compiled Elisp artifacts out of the runtime and repository.
+  - The stale =org-roam-agent.elc= is absent and =*.elc= is ignored.
+  - Installation copies the source =org-roam-agent.el=, and the wrapper loads
+    that neighboring source file explicitly.

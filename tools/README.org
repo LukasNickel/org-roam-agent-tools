@@ -147,7 +147,8 @@ new section of this form:
 #+begin_example
 * Observation :agent:
 :PROPERTIES:
-:SOURCE_SESSION: [[file:/path/to/transcript.md][agent-shell session ...]]
+:SOURCE_SESSION_ID: ...
+:SOURCE_TRANSCRIPT: [[file:../../provenance/agent-shell/.../snapshot.md][agent-shell session ...]]
 :END:
 
 Draft text
@@ -169,10 +170,11 @@ org-roam-agent prepare-capture \
 #+end_src
 
 The new child heading receives its own ID, the =:agent:= tag, and the same
-=SOURCE_SESSION= provenance. Existing content is not rewritten. To avoid
-saving unrelated edits when the user finalizes the capture, the command
-rejects a parent file that already has unsaved buffer changes. The
-=--section-title= and =--template= options are not used for child nodes.
+=SOURCE_SESSION_ID= and =SOURCE_TRANSCRIPT= provenance. Existing content is
+not rewritten. To avoid saving unrelated edits when the user finalizes the
+capture, the command rejects a parent file that already has unsaved buffer
+changes. The =--section-title= and =--template= options are not used for child
+nodes.
 
 Both capture modes return a JSON result with status =prepared= and a
 =request_id=, then open the ordinary Org capture UI. Finalize with =C-c C-c=
@@ -215,9 +217,18 @@ Relative transcript paths are made absolute against the directory from which
 the command is invoked. An explicit file is accepted only when its real path
 is beneath an =.agent-shell/transcripts= directory and its header contains the
 requested session ID. The transcript may be in the Org tree or an unrelated
-project. Automatic resolution remains the normal path. External transcripts
-are linked in place and are not copied into the Org tree. The capture body is
-limited to 100,000 characters.
+project. Automatic resolution remains the normal path.
+
+At preparation time, the helper stages an immutable snapshot of the resolved
+transcript and inserts its final portable relative link into the capture
+buffer. The snapshot's destination is content-addressed beneath
+=provenance/agent-shell/YEAR/SESSION-HASH/CONTENT-SHA256.md= in the configured
+Org-roam directory. Finalizing archives the snapshot before Org saves the note;
+an archive failure prevents the note from being saved. Aborting deletes the
+staged snapshot. Captures of identical transcript content in the same session
+and year reuse the existing archive file. The prepared JSON result reports the
+future =provenance_file= and =provenance_sha256=. The capture body is limited
+to 100,000 characters.
 
 * Connection
 

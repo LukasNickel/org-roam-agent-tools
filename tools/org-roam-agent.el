@@ -81,6 +81,9 @@
 (defconst org-roam-agent-maximum-template-preview-characters 4000
   "Maximum characters returned from a configured capture template body.")
 
+(defconst org-roam-agent-provenance-directory "provenance/agent-shell"
+  "Directory beneath `org-roam-directory' for archived transcript snapshots.")
+
 (defvar org-roam-agent--child-parent-id nil
   "ID of the parent for the active child-node capture.")
 
@@ -993,11 +996,117 @@ transcript directory and its bounded header must identify SESSION-ID."
       (user-error "Transcript does not belong to session %s" session-id))
     resolved))
 
-(defun org-roam-agent--capture-source-link (transcript session-id)
-  "Return an Org link to TRANSCRIPT described by SESSION-ID."
+(defun org-roam-agent--file-sha256 (file)
+  "Return the SHA-256 digest of FILE's literal contents."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert-file-contents-literally file)
+    (secure-hash 'sha256 (current-buffer))))
+
+(defun org-roam-agent--stage-provenance (transcript session-id)
+  "Stage an immutable snapshot of TRANSCRIPT for SESSION-ID."
+  (let ((staged-file
+         (make-temp-file "org-roam-agent-provenance-" nil ".md")))
+    (condition-case error-data
+        (progn
+          (copy-file transcript staged-file t)
+          (let* ((content-hash (org-roam-agent--file-sha256 staged-file))
+                 (session-hash
+                  (substring (secure-hash 'sha256 session-id) 0 16))
+                 (relative-file
+                  (format "%s/%s/%s/%s.md"
+                          org-roam-agent-provenance-directory
+                          (format-time-string "%Y")
+                          session-hash
+                          content-hash))
+                 (archive-file
+                  (expand-file-name relative-file
+                                    (org-roam-agent--root-directory))))
+            `((staged_file . ,staged-file)
+              (archive_file . ,archive-file)
+              (content_hash . ,content-hash)
+              (session_id . ,session-id))))
+      (error
+       (when (file-exists-p staged-file)
+         (delete-file staged-file))
+       (signal (car error-data) (cdr error-data))))))
+
+(defun org-roam-agent--provenance-placeholder (request-id)
+  "Return the unique provenance placeholder for REQUEST-ID."
+  (format "ORG_ROAM_AGENT_PROVENANCE_%s" request-id))
+
+(defun org-roam-agent--discard-staged-provenance (provenance)
+  "Delete PROVENANCE's staged snapshot when it still exists."
+  (when-let ((staged-file (alist-get 'staged_file provenance)))
+    (when (file-exists-p staged-file)
+      (delete-file staged-file))))
+
+(defun org-roam-agent--capture-source-link
+    (archive-file target-file session-id)
+  "Return a relative Org link from TARGET-FILE to ARCHIVE-FILE for SESSION-ID."
   (org-link-make-string
-   (concat "file:" transcript)
+   (concat "file:"
+           (file-relative-name archive-file
+                               (file-name-directory target-file)))
    (format "agent-shell session %s" session-id)))
+
+(defun org-roam-agent--install-provenance-link
+    (request-id provenance target-file)
+  "Install REQUEST-ID's portable link to PROVENANCE for TARGET-FILE."
+  (let ((placeholder (org-roam-agent--provenance-placeholder request-id))
+        (link
+         (org-roam-agent--capture-source-link
+          (alist-get 'archive_file provenance)
+          target-file
+          (alist-get 'session_id provenance))))
+    (save-restriction
+      (widen)
+      (goto-char (point-min))
+      (unless (search-forward placeholder nil t)
+        (user-error "Capture provenance placeholder is missing"))
+      (replace-match link t t)
+      (when (search-forward placeholder nil t)
+        (user-error "Capture contains duplicate provenance placeholders")))))
+
+(defun org-roam-agent--materialize-provenance (provenance)
+  "Materialize staged PROVENANCE at its immutable archive path."
+  (let* ((staged-file (alist-get 'staged_file provenance))
+         (archive-file (alist-get 'archive_file provenance))
+         (content-hash (alist-get 'content_hash provenance))
+         (archive-directory (file-name-directory archive-file)))
+    (if (file-exists-p archive-file)
+        (progn
+          (unless (and (file-regular-p archive-file)
+                       (equal (org-roam-agent--file-sha256 archive-file)
+                              content-hash))
+            (user-error
+             "Provenance archive path contains different content: %s"
+             archive-file))
+          (org-roam-agent--discard-staged-provenance provenance))
+      (unless (and staged-file (file-regular-p staged-file))
+        (user-error "Staged provenance snapshot is missing"))
+      (make-directory archive-directory t)
+      (let ((pending-file
+             (make-temp-file
+              (expand-file-name ".org-roam-agent-pending-"
+                                archive-directory))))
+        (unwind-protect
+            (progn
+              (copy-file staged-file pending-file t t)
+              (unless (equal (org-roam-agent--file-sha256 pending-file)
+                             content-hash)
+                (user-error "Staged provenance changed while being archived"))
+              (rename-file pending-file archive-file))
+          (when (file-exists-p pending-file)
+            (delete-file pending-file))))
+      (org-roam-agent--discard-staged-provenance provenance))))
+
+(defun org-roam-agent--capture-before-finalize ()
+  "Archive provenance before saving an agent-authored Org capture."
+  (unless org-note-abort
+    (when-let ((provenance
+                (org-capture-get :org-roam-agent-provenance)))
+      (org-roam-agent--materialize-provenance provenance))))
 
 (defun org-roam-agent--nest-body-headings (body levels)
   "Demote real Org headings in BODY by LEVELS.
@@ -1020,17 +1129,19 @@ Headline-looking text inside source and example blocks is left unchanged."
     (buffer-substring-no-properties (point-min) (point-max))))
 
 (defun org-roam-agent--agent-heading
-    (level title body transcript session-id &optional id)
+    (level title body provenance-placeholder session-id &optional id)
   "Build an agent-authored heading at LEVEL.
 
-TITLE and BODY are its content.  TRANSCRIPT and SESSION-ID record provenance.
-When ID is non-nil, make the heading an Org-roam node with that ID."
+TITLE and BODY are its content.  PROVENANCE-PLACEHOLDER is replaced with a
+portable transcript link after the capture target is known.  SESSION-ID records
+the source session.  When ID is non-nil, make the heading an Org-roam node with
+that ID."
   (concat
    (make-string level ?*) " " title " :agent:\n"
    ":PROPERTIES:\n"
    (when id (format ":ID: %s\n" id))
-   (format ":SOURCE_SESSION: %s\n"
-           (org-roam-agent--capture-source-link transcript session-id))
+   (format ":SOURCE_SESSION_ID: %s\n" session-id)
+   (format ":SOURCE_TRANSCRIPT: %s\n" provenance-placeholder)
    ":END:\n\n"
    (string-trim-right (org-roam-agent--nest-body-headings body level))
    "\n"))
@@ -1105,6 +1216,10 @@ Only `org-roam-agent-maximum-capture-requests' newest records are retained."
 
 (defun org-roam-agent--capture-after-finalize ()
   "Record the outcome of an agent-authored Org capture, when applicable."
+  (when-let ((provenance
+              (org-capture-get :org-roam-agent-provenance)))
+    (when org-note-abort
+      (org-roam-agent--discard-staged-provenance provenance)))
   (when-let* ((request-id
                (org-capture-get :org-roam-agent-request-id))
               (record
@@ -1116,17 +1231,24 @@ Only `org-roam-agent-maximum-capture-requests' newest records are retained."
             (alist-get 'finished_at record) finished-at)
       (puthash request-id record org-roam-agent--capture-requests))))
 
-(defun org-roam-agent--track-active-capture (request-id result)
-  "Track the active Org capture represented by RESULT under REQUEST-ID."
+(defun org-roam-agent--track-active-capture (request-id provenance result)
+  "Track the active Org capture represented by RESULT under REQUEST-ID.
+
+PROVENANCE describes the staged transcript snapshot for this capture."
   (let ((prepared-at (org-roam-agent--capture-timestamp)))
     (org-capture-put :org-roam-agent-request-id request-id)
+    (org-capture-put :org-roam-agent-provenance provenance)
     ;; `org-capture-finalize' replaces the global capture plist with this
     ;; capture buffer's local copy before running the after-finalize hook.
     (setq-local org-capture-current-plist
-                (plist-put org-capture-current-plist
-                           :org-roam-agent-request-id request-id))
+                (plist-put
+                 (plist-put org-capture-current-plist
+                            :org-roam-agent-request-id request-id)
+                 :org-roam-agent-provenance provenance))
     (add-hook 'org-capture-after-finalize-hook
               #'org-roam-agent--capture-after-finalize)
+    (add-hook 'org-capture-before-finalize-hook
+              #'org-roam-agent--capture-before-finalize)
     (org-roam-agent--register-capture-request
      (append `((request_id . ,request-id))
              result
@@ -1148,19 +1270,36 @@ Only `org-roam-agent-maximum-capture-requests' newest records are retained."
   "Return the lifecycle record for capture REQUEST-ID as JSON."
   (json-encode (org-roam-agent-capture-status request-id)))
 
+(defun org-roam-agent--finish-capture-preparation
+    (request-id provenance target-file result)
+  "Finish preparing REQUEST-ID for TARGET-FILE and track RESULT.
+
+PROVENANCE describes the staged snapshot.  RESULT contains fields specific to
+the selected capture mode."
+  (org-roam-agent--install-provenance-link
+   request-id provenance target-file)
+  (org-roam-agent--track-active-capture
+   request-id provenance
+   (append result
+           `((target_file . ,target-file)
+             (provenance_file . ,(alist-get 'archive_file provenance))
+             (provenance_sha256 . ,(alist-get 'content_hash provenance))))))
+
 (defun org-roam-agent--prepare-new-file-capture
-    (title section-title body transcript session-id template-key request-id)
+    (title section-title body provenance template-key request-id)
   "Prepare a new file capture and return a JSON-ready result.
 
 TITLE names the file node.  SECTION-TITLE and BODY form its agent-authored
-section.  TRANSCRIPT and SESSION-ID record provenance.  TEMPLATE-KEY selects
-one of the configured Org-roam capture templates."
+section.  PROVENANCE describes the staged source snapshot.  TEMPLATE-KEY
+selects one of the configured Org-roam capture templates."
   (unless (require 'org-roam-capture nil t)
     (user-error "Org-roam capture is not available in this Emacs instance"))
   (let* ((id (org-id-new))
          (node (org-roam-node-create :id id :title title))
          (section (org-roam-agent--agent-heading
-                   1 section-title body transcript session-id))
+                   1 section-title body
+                   (org-roam-agent--provenance-placeholder request-id)
+                   (alist-get 'session_id provenance)))
          (template (org-roam-agent--new-file-template
                     template-key section)))
     (org-roam-capture- :keys template-key
@@ -1170,22 +1309,20 @@ one of the configured Org-roam capture templates."
            (target-file
             (and (buffer-live-p target-buffer)
                  (buffer-local-value 'buffer-file-name target-buffer))))
-      (org-roam-agent--track-active-capture
-       request-id
+      (org-roam-agent--finish-capture-preparation
+       request-id provenance target-file
        `((status . "prepared")
          (mode . "new-file")
          (node_id . ,id)
          (title . ,title)
-         (template . ,template-key)
-         (target_file . ,target-file)
-         (provenance_file . ,transcript))))))
+         (template . ,template-key))))))
 
 (defun org-roam-agent--prepare-child-capture
-    (title body transcript session-id parent-id request-id)
+    (title body provenance parent-id request-id)
   "Prepare a child heading node capture and return a JSON-ready result.
 
-TITLE and BODY form the new node beneath PARENT-ID.  TRANSCRIPT and SESSION-ID
-record provenance."
+TITLE and BODY form the new node beneath PARENT-ID.  PROVENANCE describes the
+staged source snapshot."
   (let* ((parent (or (org-roam-node-from-id parent-id)
                      (user-error "No Org-roam parent node with ID %s"
                                  parent-id)))
@@ -1194,7 +1331,9 @@ record provenance."
          (id (org-id-new))
          (key "A")
          (content (org-roam-agent--agent-heading
-                   1 title body transcript session-id id))
+                   1 title body
+                   (org-roam-agent--provenance-placeholder request-id)
+                   (alist-get 'session_id provenance) id))
          (org-capture-templates
           `((,key "agent child node" entry
              (file+function
@@ -1209,15 +1348,13 @@ record provenance."
         (user-error
          "Parent node has unsaved changes; save or discard them before capture")))
     (org-capture nil key)
-    (org-roam-agent--track-active-capture
-     request-id
+    (org-roam-agent--finish-capture-preparation
+     request-id provenance parent-file
      `((status . "prepared")
        (mode . "child-node")
        (node_id . ,id)
        (title . ,title)
-       (parent_id . ,parent-id)
-       (target_file . ,parent-file)
-       (provenance_file . ,transcript)))))
+       (parent_id . ,parent-id)))))
 
 ;;;###autoload
 (defun org-roam-agent-prepare-capture
@@ -1241,26 +1378,34 @@ the capture; the user must explicitly finalize or abort it in Emacs."
   (setq title (org-roam-agent--capture-single-line title "Title")
         session-id (org-roam-agent--capture-single-line
                     session-id "Session ID"))
-  (let ((body (org-roam-agent--read-capture-body body-file))
-        (transcript
+  (let* ((body (org-roam-agent--read-capture-body body-file))
+         (transcript
          (if transcript-file
              (org-roam-agent--explicit-transcript-for-session
               transcript-file session-id)
            (org-roam-agent--transcript-for-session
             session-id invocation-directory)))
-        (request-id (org-id-new)))
-    (if parent-id
-        (org-roam-agent--prepare-child-capture
-         title body transcript session-id
-         (org-roam-agent--capture-single-line parent-id "Parent ID")
-         request-id)
-      (org-roam-agent--prepare-new-file-capture
-       title
-       (org-roam-agent--capture-single-line
-        section-title "Section title")
-       body transcript session-id
-       (or template-key org-roam-agent-default-capture-template)
-       request-id))))
+         (request-id (org-id-new))
+         (provenance (org-roam-agent--stage-provenance
+                      transcript session-id))
+         (prepared nil))
+    (unwind-protect
+        (prog1
+            (if parent-id
+                (org-roam-agent--prepare-child-capture
+                 title body provenance
+                 (org-roam-agent--capture-single-line parent-id "Parent ID")
+                 request-id)
+              (org-roam-agent--prepare-new-file-capture
+               title
+               (org-roam-agent--capture-single-line
+                section-title "Section title")
+               body provenance
+               (or template-key org-roam-agent-default-capture-template)
+               request-id))
+          (setq prepared t))
+      (unless prepared
+        (org-roam-agent--discard-staged-provenance provenance)))))
 
 ;;;###autoload
 (defun org-roam-agent-prepare-capture-json

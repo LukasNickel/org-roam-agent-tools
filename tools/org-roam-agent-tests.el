@@ -2,6 +2,12 @@
 
 (require 'ert)
 (require 'cl-lib)
+(defvar org-roam-directory)
+(defvar org-capture-before-finalize-hook)
+(defvar org-capture-after-finalize-hook)
+(defvar org-capture-plist)
+(defvar org-note-abort)
+(defvar org-roam-capture-templates)
 (load (expand-file-name "org-roam-agent.el"
                         (file-name-directory (or load-file-name
                                                  buffer-file-name)))
@@ -245,6 +251,7 @@
 (ert-deftest org-roam-agent-track-active-capture-records-local-plist ()
   (let ((org-roam-agent--capture-requests (make-hash-table :test #'equal))
         (org-roam-agent--capture-request-order nil)
+        (org-capture-before-finalize-hook nil)
         (org-capture-after-finalize-hook nil)
         (org-capture-plist nil))
     (with-temp-buffer
@@ -252,12 +259,16 @@
       (cl-letf (((symbol-function 'org-roam-agent--capture-timestamp)
                  (lambda () "2026-09-15T12:00:00+0200")))
         (org-roam-agent--track-active-capture
-         "request-1" '((status . "prepared"))))
+         "request-1"
+         '((staged_file . "/tmp/staged.md"))
+         '((status . "prepared"))))
       (should (equal (plist-get org-capture-current-plist
                                 :org-roam-agent-request-id)
                      "request-1"))
       (should (memq #'org-roam-agent--capture-after-finalize
                     org-capture-after-finalize-hook))
+      (should (memq #'org-roam-agent--capture-before-finalize
+                    org-capture-before-finalize-hook))
       (should
        (equal
         (alist-get 'status
@@ -268,6 +279,225 @@
   (let ((org-roam-agent--capture-requests (make-hash-table :test #'equal)))
     (should-error (org-roam-agent-capture-status "missing")
                   :type 'user-error)))
+
+(defun org-roam-agent-test--with-child-capture (callback)
+  "Call CALLBACK with an active child capture in temporary directories.
+
+CALLBACK receives RESULT, a PREPARE function, ROOT, PARENT-FILE, and
+TRANSCRIPT.  PREPARE starts another capture from the same transcript."
+  (let* ((root (make-temp-file "org-roam-agent-root-" t))
+         (project (make-temp-file "org-roam-agent-project-" t))
+         (transcript-directory
+          (expand-file-name ".agent-shell/transcripts" project))
+         (transcript (expand-file-name "session.md" transcript-directory))
+         (body-file (expand-file-name "body.org" project))
+         (parent-directory (expand-file-name "notes" root))
+         (parent-file (expand-file-name "parent.org" parent-directory))
+         (org-roam-directory root)
+         (org-roam-agent--capture-requests (make-hash-table :test #'equal))
+         (org-roam-agent--capture-request-order nil)
+         (org-capture-before-finalize-hook nil)
+         (org-capture-after-finalize-hook nil)
+         (org-capture-plist nil)
+         (org-note-abort nil)
+         (real-require (symbol-function 'require)))
+    (unwind-protect
+        (progn
+          (make-directory transcript-directory t)
+          (make-directory parent-directory t)
+          (with-temp-file transcript
+            (insert "# Agent Shell Transcript\n\n"
+                    "**Session ID:** session-123\n\n"
+                    "Durable discussion.\n"))
+          (with-temp-file body-file
+            (insert "Captured conclusion.\n"))
+          (with-temp-file parent-file
+            (insert "* Parent\n:PROPERTIES:\n:ID: parent-id\n:END:\n"))
+          (cl-labels
+              ((prepare
+                (title)
+                (cl-letf
+                    (((symbol-function 'require)
+                      (lambda (feature &optional filename noerror)
+                        (if (eq feature 'org-roam)
+                            t
+                          (funcall real-require feature filename noerror))))
+                     ((symbol-function 'org-roam-node-from-id)
+                      (lambda (id) (and (equal id "parent-id") 'parent)))
+                     ((symbol-function 'org-roam-node-file)
+                      (lambda (_node) parent-file)))
+                  (org-roam-agent-prepare-capture
+                   title nil body-file "session-123"
+                   nil "parent-id" transcript project))))
+            (funcall callback
+                     (prepare "Observation") #'prepare
+                     root parent-file transcript)))
+      (when (bound-and-true-p org-capture-mode)
+        (org-capture-kill))
+      (dolist (buffer (buffer-list))
+        (when-let ((file (buffer-file-name buffer)))
+          (when (or (file-in-directory-p file root)
+                    (file-in-directory-p file project))
+            (kill-buffer buffer))))
+      (delete-directory root t)
+      (delete-directory project t))))
+
+(ert-deftest org-roam-agent-prepare-capture-abort-leaves-no-provenance-archive ()
+  (org-roam-agent-test--with-child-capture
+   (lambda (result _prepare root _parent-file _transcript)
+     (let ((archive (alist-get 'provenance_file result))
+           (request-id (alist-get 'request_id result)))
+       (should (string-prefix-p
+                (expand-file-name "provenance/agent-shell/" root)
+                archive))
+       (should-not (file-exists-p archive))
+       (should (string-match-p
+                ":SOURCE_SESSION_ID: session-123"
+                (buffer-string)))
+       (should (string-match-p
+                ":SOURCE_TRANSCRIPT: \\[\\[file:\.\./provenance/agent-shell/"
+                (buffer-string)))
+       (org-capture-kill)
+       (should-not (file-exists-p archive))
+       (should
+        (equal (alist-get 'status
+                          (org-roam-agent-capture-status request-id))
+               "aborted"))))))
+
+(ert-deftest org-roam-agent-prepare-capture-finalize-archives-provenance ()
+  (org-roam-agent-test--with-child-capture
+   (lambda (result prepare root parent-file transcript)
+     (let ((archive (alist-get 'provenance_file result))
+           (request-id (alist-get 'request_id result)))
+       (should-not (file-exists-p archive))
+       (org-capture-finalize)
+       (should (file-exists-p archive))
+       (should
+        (string=
+         (with-temp-buffer
+           (insert-file-contents-literally transcript)
+           (buffer-string))
+         (with-temp-buffer
+           (insert-file-contents-literally archive)
+           (buffer-string))))
+       (should
+        (equal (alist-get 'status
+                          (org-roam-agent-capture-status request-id))
+               "finalized"))
+       (with-temp-buffer
+         (insert-file-contents parent-file)
+         (should (search-forward ":SOURCE_SESSION_ID: session-123" nil t))
+         (should
+          (search-forward
+           ":SOURCE_TRANSCRIPT: [[file:../provenance/agent-shell/" nil t)))
+       (setq result (funcall prepare "Second observation"))
+       (should (equal (alist-get 'provenance_file result) archive))
+       (org-capture-finalize)
+       (should
+        (= (length
+            (directory-files-recursively
+             (expand-file-name "provenance/agent-shell" root) "\\.md\\'"))
+           1))))))
+
+(ert-deftest org-roam-agent-prepare-capture-archive-failure-prevents-save ()
+  (org-roam-agent-test--with-child-capture
+   (lambda (result _prepare _root parent-file _transcript)
+     (let* ((archive (alist-get 'provenance_file result))
+            (blocking-path
+             (directory-file-name (file-name-directory archive)))
+            (request-id (alist-get 'request_id result)))
+       (make-directory (file-name-directory blocking-path) t)
+       (with-temp-file blocking-path
+         (insert "Blocks the archive directory."))
+       (should-error (org-capture-finalize))
+       (should-not (file-exists-p archive))
+       (with-temp-buffer
+         (insert-file-contents parent-file)
+         (should-not (search-forward "Captured conclusion." nil t)))
+       (should-not
+        (equal (alist-get 'status
+                          (org-roam-agent-capture-status request-id))
+               "finalized"))
+       (delete-file blocking-path)
+       (when (bound-and-true-p org-capture-mode)
+         (org-capture-kill))
+       (should
+        (equal (alist-get 'status
+                          (org-roam-agent-capture-status request-id))
+               "aborted"))))))
+
+(ert-deftest org-roam-agent-prepare-new-file-archives-portable-provenance ()
+  (let* ((root (make-temp-file "org-roam-agent-root-" t))
+         (project (make-temp-file "org-roam-agent-project-" t))
+         (transcript-directory
+          (expand-file-name ".agent-shell/transcripts" project))
+         (transcript (expand-file-name "session.md" transcript-directory))
+         (body-file (expand-file-name "body.org" project))
+         (target-directory (expand-file-name "notes" root))
+         (target-file (expand-file-name "new.org" target-directory))
+         (org-roam-directory root)
+         (org-roam-capture-templates
+          '(("s" "standard" plain "#+title: ${title}\n"
+             :target (file "unused.org"))))
+         (org-roam-agent--capture-requests (make-hash-table :test #'equal))
+         (org-roam-agent--capture-request-order nil)
+         (org-capture-before-finalize-hook nil)
+         (org-capture-after-finalize-hook nil)
+         (org-capture-plist nil)
+         (org-note-abort nil)
+         (real-require (symbol-function 'require))
+         result)
+    (unwind-protect
+        (progn
+          (make-directory transcript-directory t)
+          (make-directory target-directory t)
+          (with-temp-file transcript
+            (insert "# Agent Shell Transcript\n\n"
+                    "**Session ID:** session-123\n\n"
+                    "Durable discussion.\n"))
+          (with-temp-file body-file
+            (insert "Captured conclusion.\n"))
+          (cl-letf
+              (((symbol-function 'require)
+                (lambda (feature &optional filename noerror)
+                  (if (memq feature '(org-roam org-roam-capture))
+                      t
+                    (funcall real-require feature filename noerror))))
+               ((symbol-function 'org-roam-node-create)
+                (lambda (&rest _slots) 'new-node))
+               ((symbol-function 'org-roam-capture-)
+                (lambda (&rest arguments)
+                  (let* ((template
+                          (car (plist-get arguments :templates)))
+                         (content (nth 3 template))
+                         (org-capture-templates
+                          `(("N" "new file" plain
+                             (file ,target-file) ,content :unnarrowed t))))
+                    (org-capture nil "N")))))
+            (setq result
+                  (org-roam-agent-prepare-capture
+                   "New note" "Observation" body-file "session-123"
+                   "s" nil transcript project)))
+          (let ((archive (alist-get 'provenance_file result)))
+            (should (equal (alist-get 'mode result) "new-file"))
+            (should (string-match-p
+                     ":SOURCE_TRANSCRIPT: \\[\\[file:\.\./provenance/agent-shell/"
+                     (buffer-string)))
+            (org-capture-finalize)
+            (should (file-exists-p archive))
+            (with-temp-buffer
+              (insert-file-contents target-file)
+              (should (search-forward ":SOURCE_SESSION_ID: session-123" nil t))
+              (should (search-forward "Captured conclusion." nil t)))))
+      (when (bound-and-true-p org-capture-mode)
+        (org-capture-kill))
+      (dolist (buffer (buffer-list))
+        (when-let ((file (buffer-file-name buffer)))
+          (when (or (file-in-directory-p file root)
+                    (file-in-directory-p file project))
+            (kill-buffer buffer))))
+      (delete-directory root t)
+      (delete-directory project t))))
 
 (provide 'org-roam-agent-tests)
 

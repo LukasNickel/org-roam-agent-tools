@@ -9,11 +9,19 @@ Answer from the user's existing Org-roam collection without changing it.
 
 ## Locate the interface
 
-Resolve `org-roam-agent` from `PATH` with `command -v`. Stop and explain the
-missing global installation if the command is absent or not executable.
-Treat an Emacs connection error containing `Operation not permitted` as a
-sandbox restriction and retry the unchanged command with narrowly scoped
-approval to reach the running Emacs server.
+Resolve `org-roam-agent` from `PATH` with `command -v`. Use the exact absolute
+path it returns for subsequent invocations so a narrowly scoped command rule
+can match the installed interface. Stop and explain the missing global
+installation if the command is absent or not executable.
+
+On Codex, request outside-sandbox execution for each helper invocation from the
+outset, scoped to that exact executable and command. Do not first probe the
+Emacs socket from inside the sandbox. The configured command rule remains the
+authority: a `prompt` decision requires user approval, while `allow` may proceed
+without a prompt. On another host, use its equivalent least-privilege execution
+mechanism when available. If the helper still reports an Emacs connection error
+containing `Operation not permitted`, explain that the host has not granted the
+required bounded access; do not probe the socket or change Emacs.
 
 ## Find candidate nodes
 

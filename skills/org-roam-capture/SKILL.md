@@ -19,16 +19,25 @@ A suggestion is not authorization to prepare a capture.
 
 ## Locate the interface
 
-Resolve `org-roam-agent` from `PATH` with `command -v`. Stop and explain the
-missing global installation if the command is absent or not executable.
+Resolve `org-roam-agent` from `PATH` with `command -v`. Use the exact absolute
+path it returns for subsequent invocations so a narrowly scoped command rule
+can match the installed interface. Stop and explain the missing global
+installation if the command is absent or not executable.
+
+On Codex, request outside-sandbox execution for each helper invocation from the
+outset, scoped to that exact executable and command. Do not first probe the
+Emacs socket from inside the sandbox. The configured command rule remains the
+authority: a `prompt` decision requires user approval, while `allow` may proceed
+without a prompt. On another host, use its equivalent least-privilege execution
+mechanism when available.
 
 Run `capabilities` before designing a capture. Use its `default_template` for a
 new file node unless the user specifies another template. Use each template's
 configured `purpose`, target, and initial-content preview to explain deliberate
 non-default choices. Do not invent a purpose when capabilities returns null.
-Treat an Emacs connection error containing `Operation not permitted` as a
-sandbox restriction: retry the unchanged command with narrowly scoped approval
-to reach the running Emacs server.
+If the helper still reports an Emacs connection error containing `Operation not
+permitted`, explain that the host has not granted the required bounded access;
+do not probe the socket or change Emacs.
 
 ## Design the capture
 
@@ -85,15 +94,19 @@ For a new file node, pass the confirmed title, section title, body file, and
 template. For a child node, pass the confirmed title, body file, and parent ID;
 do not pass a section title or template.
 
-The helper adds the `:agent:` tag and `SOURCE_SESSION` provenance. Preserve the
-returned `request_id`. A result with `"status":"prepared"` means only that
-Emacs opened the capture UI. Report the mode, proposed target, and that the
-capture is prepared, then tell the user to finalize with `C-c C-c` or abort
-with `C-c C-k`.
+The helper adds the `:agent:` tag, the stable `SOURCE_SESSION_ID`, and a
+portable relative `SOURCE_TRANSCRIPT` link. It stages an immutable transcript
+snapshot during preparation but archives it beneath the Org-roam directory
+only when the user finalizes. Preserve the returned `request_id`. A result with
+`"status":"prepared"` means only that Emacs opened the capture UI. Report the
+mode, proposed target, and that the capture is prepared, then tell the user to
+finalize with `C-c C-c` or abort with `C-c C-k`.
 
 After the user says they finished, query `capture-status --request-id ID`
 before reporting the outcome. Report a node as created only for
-`"status":"finalized"`; `"aborted"` means no new content was saved. An unknown
-or expired request is not evidence of either outcome. The user may edit the
-capture; the saved note is authoritative and need not be read back unless
-later work depends on its final text.
+`"status":"finalized"`; its content-addressed transcript snapshot is then
+present under `provenance/agent-shell` in the Org-roam directory. `"aborted"`
+means no new content or provenance snapshot was saved. An unknown or expired
+request is not evidence of either outcome. The user may edit the capture; the
+saved note is authoritative and need not be read back unless later work
+depends on its final text.
