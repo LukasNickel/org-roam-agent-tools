@@ -17,11 +17,13 @@ Usage:
   $program_name search-text --query QUERY [--regex] [--limit LIMIT]
   $program_name context --file FILE --line LINE [--max-chars CHARACTERS]
   $program_name links --id NODE_ID [--limit LIMIT]
+  $program_name headings --parent-id NODE_ID
   $program_name capabilities
   $program_name capture-status --request-id REQUEST_ID
   $program_name prepare-capture --title TITLE --body-file FILE
     [--section-title TITLE] [--template KEY] [--session-id ID]
     [--transcript-file FILE] [--parent-id ID]
+    [--parent-heading HEADING]...
 
 Search the configured Org-roam database by node title, alias, and tag.
 Results are emitted as JSON. LIMIT defaults to $default_limit and may not
@@ -40,6 +42,10 @@ Return resolved Org-roam ID links for NODE_ID, separated into backlinks and
 outgoing links. LIMIT defaults to $default_link_limit and may not exceed
 $maximum_link_limit per direction.
 
+List headings beneath an Org-roam file or heading node. Returned outline paths
+are relative to --parent-id and can be supplied to prepare-capture with one
+--parent-heading argument per path component.
+
 Report configured capture templates, or prepare an interactive Org capture.
 Query a prepared capture by request ID to determine whether it remains open,
 was finalized, or was aborted. Capture status is kept in the running Emacs
@@ -47,8 +53,10 @@ instance and is bounded to the most recent requests.
 
 Without --parent-id, a new file node is prepared and --section-title is
 required. With --parent-id, a new child heading node is prepared beneath that
-Org-roam node and TITLE is used as its heading. Captures are never finalized
-automatically. --session-id defaults to CODEX_SESSION_ID when available.
+Org-roam node and TITLE is used as its heading. Repeated --parent-heading
+arguments select an ID-less descendant by its relative outline path. Captures
+are never finalized automatically. --session-id defaults to CODEX_SESSION_ID
+when available.
 --transcript-file selects a matching transcript explicitly when automatic
 session lookup is ambiguous. Relative transcript paths resolve against the
 directory from which this command is invoked.
@@ -90,6 +98,7 @@ body_file=""
 session_id="${CODEX_SESSION_ID:-}"
 template="s"
 parent_id=""
+parent_headings=()
 request_id=""
 transcript_file=""
 node_id=""
@@ -242,6 +251,29 @@ case "$command" in
       (base64-decode-string \"$node_id_base64\")
       $link_limit)"
     ;;
+  headings)
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --parent-id)
+          [[ $# -ge 2 ]] || fail "--parent-id requires a value"
+          parent_id="$2"
+          shift 2
+          ;;
+        -h|--help)
+          usage
+          exit 0
+          ;;
+        *)
+          fail "unknown argument: $1"
+          ;;
+      esac
+    done
+
+    [[ -n "$parent_id" ]] || fail "--parent-id must not be empty"
+    readonly parent_id_base64="$(encode_base64 "$parent_id")"
+    eval_body="(org-roam-agent-headings-json
+      (base64-decode-string \"$parent_id_base64\"))"
+    ;;
   capabilities)
     [[ $# -eq 0 ]] || fail "capabilities accepts no arguments"
     eval_body="(org-roam-agent-capabilities-json)"
@@ -307,6 +339,11 @@ case "$command" in
           parent_id="$2"
           shift 2
           ;;
+        --parent-heading)
+          [[ $# -ge 2 ]] || fail "--parent-heading requires a value"
+          parent_headings+=("$2")
+          shift 2
+          ;;
         -h|--help)
           usage
           exit 0
@@ -326,6 +363,9 @@ case "$command" in
     if [[ -z "$parent_id" && -z "$section_title" ]]; then
       fail "--section-title is required when creating a new file node"
     fi
+    if (( ${#parent_headings[@]} > 0 )) && [[ -z "$parent_id" ]]; then
+      fail "--parent-heading requires --parent-id"
+    fi
     if [[ -n "$transcript_file" ]]; then
       [[ -f "$transcript_file" ]] || \
         fail "transcript file is not a regular file: $transcript_file"
@@ -340,6 +380,12 @@ case "$command" in
     readonly parent_id_base64="$(encode_base64 "$parent_id")"
     readonly transcript_file_base64="$(encode_base64 "$transcript_file")"
     readonly invocation_directory_base64="$(encode_base64 "$(pwd -P)")"
+    parent_headings_form="(list"
+    for parent_heading in "${parent_headings[@]}"; do
+      parent_heading_base64="$(encode_base64 "$parent_heading")"
+      parent_headings_form+=" (base64-decode-string \"$parent_heading_base64\")"
+    done
+    parent_headings_form+=")"
     eval_body="(let ((parent-id
                        (base64-decode-string \"$parent_id_base64\"))
                      (transcript-file
@@ -352,7 +398,8 @@ case "$command" in
        (base64-decode-string \"$template_base64\")
        (unless (string-empty-p parent-id) parent-id)
        (unless (string-empty-p transcript-file) transcript-file)
-       (base64-decode-string \"$invocation_directory_base64\")))"
+       (base64-decode-string \"$invocation_directory_base64\")
+       $parent_headings_form))"
     ;;
     *)
       fail "unknown command: $command"

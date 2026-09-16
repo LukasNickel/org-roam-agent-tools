@@ -104,13 +104,17 @@ The remaining items are optional provenance and data-model improvements.
 
 ## Agent section identity
 
-- [ ] Decide whether the tagged agent section in a newly created file node
-  should receive its own Org ID.
-  - An ID would make the agent-authored section independently linkable and
-    queryable as an Org-roam node.
-  - Omitting it keeps a simple one-node-per-file structure.
-  - Preserve the rule that agent-authored text lives in an `:agent:` tagged
-    section either way.
+- [x] Give every generated agent section its own Org ID.
+  - New-file capture returns the distinct file-node =node_id= and agent-section
+    =section_node_id=; child capture returns the same ID in both fields.
+  - A single =--parent-id= anchors placement at either a file node or heading
+    node. Without a relative path, file anchors append a top-level section and
+    heading anchors receive a child.
+  - =headings --parent-id ID= exposes Org-derived relative outline paths.
+    Repeated =--parent-heading= arguments select an ID-less descendant without
+    parsing note files manually.
+  - Missing, duplicate, changed, or unsaved targets are rejected rather than
+    guessed. Relative paths remain inside the anchor subtree.
 
 ## Compiled Elisp
 

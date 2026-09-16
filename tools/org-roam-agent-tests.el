@@ -280,7 +280,66 @@
     (should-error (org-roam-agent-capture-status "missing")
                   :type 'user-error)))
 
-(defun org-roam-agent-test--with-child-capture (callback)
+(ert-deftest org-roam-agent-headings-lists-file-node-outline-paths ()
+  (let ((file (make-temp-file "org-roam-agent-headings-" nil ".org"))
+        (real-require (symbol-function 'require)))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert ":PROPERTIES:\n:ID: file-id\n:END:\n"
+                    "#+title: Heading test\n\n"
+                    "* Overview\n"
+                    "** Sandboxing\n"
+                    ":PROPERTIES:\n:ID: sandbox-id\n:END:\n"
+                    "*** Approval rules\n"))
+          (cl-letf (((symbol-function 'require)
+                     (lambda (feature &optional filename noerror)
+                       (if (eq feature 'org-roam)
+                           t
+                         (funcall real-require feature filename noerror))))
+                    ((symbol-function 'org-roam-node-from-id)
+                     (lambda (id)
+                       (pcase id
+                         ("file-id" 'file-node)
+                         ("sandbox-id" 'heading-node))))
+                    ((symbol-function 'org-roam-node-id)
+                     (lambda (node)
+                       (if (eq node 'file-node) "file-id" "sandbox-id")))
+                    ((symbol-function 'org-roam-node-title)
+                     (lambda (node)
+                       (if (eq node 'file-node) "Heading test" "Sandboxing")))
+                    ((symbol-function 'org-roam-node-file)
+                     (lambda (_node) file))
+                    ((symbol-function 'org-roam-node-level)
+                     (lambda (node) (if (eq node 'file-node) 0 2))))
+            (let* ((result
+                    (json-parse-string
+                     (org-roam-agent-headings-json "file-id")
+                     :object-type 'alist :array-type 'list))
+                   (headings (alist-get 'headings result)))
+              (should (equal (mapcar (lambda (heading)
+                                       (alist-get 'title heading))
+                                     headings)
+                             '("Overview" "Sandboxing" "Approval rules")))
+              (should (equal (alist-get 'outline_path (nth 2 headings))
+                             '("Overview" "Sandboxing" "Approval rules")))
+              (should (equal (alist-get 'id (nth 1 headings))
+                             "sandbox-id")))
+            (let* ((result
+                    (json-parse-string
+                     (org-roam-agent-headings-json "sandbox-id")
+                     :object-type 'alist :array-type 'list))
+                   (headings (alist-get 'headings result)))
+              (should (= (length headings) 1))
+              (should (equal (alist-get 'outline_path (car headings))
+                             '("Approval rules"))))
+            (with-temp-file file
+              (insert "#+title: Heading test\n\n* Overview\n"))
+            (should-error (org-roam-agent-headings-json "file-id")
+                          :type 'user-error)))
+      (delete-file file))))
+
+(defun org-roam-agent-test--with-child-capture (callback &optional file-node)
   "Call CALLBACK with an active child capture in temporary directories.
 
 CALLBACK receives RESULT, a PREPARE function, ROOT, PARENT-FILE, and
@@ -314,10 +373,14 @@ TRANSCRIPT.  PREPARE starts another capture from the same transcript."
                     "\n* Nested detail\n"
                     "\nNested content.\n"))
           (with-temp-file parent-file
-            (insert "* Parent\n:PROPERTIES:\n:ID: parent-id\n:END:\n"))
+            (if file-node
+                (insert ":PROPERTIES:\n:ID: parent-id\n:END:\n"
+                        "#+title: Parent\n\n* Existing\n** Target\n")
+              (insert "* Parent\n:PROPERTIES:\n:ID: parent-id\n:END:\n"
+                      "** Existing\n*** Target\n")))
           (cl-labels
               ((prepare
-                (title)
+                (title &optional parent-headings)
                 (cl-letf
                     (((symbol-function 'require)
                       (lambda (feature &optional filename noerror)
@@ -327,10 +390,12 @@ TRANSCRIPT.  PREPARE starts another capture from the same transcript."
                      ((symbol-function 'org-roam-node-from-id)
                       (lambda (id) (and (equal id "parent-id") 'parent)))
                      ((symbol-function 'org-roam-node-file)
-                      (lambda (_node) parent-file)))
+                      (lambda (_node) parent-file))
+                     ((symbol-function 'org-roam-node-level)
+                      (lambda (_node) (if file-node 0 1))))
                   (org-roam-agent-prepare-capture
                    title nil body-file "session-123"
-                   nil "parent-id" transcript project))))
+                   nil "parent-id" transcript project parent-headings))))
             (funcall callback
                      (prepare "Observation") #'prepare
                      root parent-file transcript)))
@@ -343,6 +408,42 @@ TRANSCRIPT.  PREPARE starts another capture from the same transcript."
             (kill-buffer buffer))))
       (delete-directory root t)
       (delete-directory project t))))
+
+(ert-deftest org-roam-agent-prepare-capture-supports-file-node-anchor ()
+  (org-roam-agent-test--with-child-capture
+   (lambda (_result prepare _root _parent-file _transcript)
+     (should (string-match-p "^\\* Observation[[:space:]]+:agent:$"
+                             (buffer-string)))
+     (org-capture-kill)
+     (funcall prepare "Below existing" '("Existing"))
+     (should (string-match-p "^\\*\\* Below existing[[:space:]]+:agent:$"
+                             (buffer-string))))
+   t))
+
+(ert-deftest org-roam-agent-prepare-capture-targets-relative-heading-path ()
+  (org-roam-agent-test--with-child-capture
+   (lambda (_result prepare _root _parent-file _transcript)
+     (org-capture-kill)
+     (let ((result (funcall prepare "Nested observation"
+                            '("Existing" "Target"))))
+       (should (equal (append (alist-get 'parent_headings result) nil)
+                      '("Existing" "Target")))
+       (should (string-match-p
+                "^\\*\\*\\*\\* Nested observation[[:space:]]+:agent:$"
+                (buffer-string)))))))
+
+(ert-deftest org-roam-agent-prepare-capture-rejects-ambiguous-heading-path ()
+  (org-roam-agent-test--with-child-capture
+   (lambda (_result prepare _root parent-file _transcript)
+     (org-capture-kill)
+     (when-let ((buffer (find-buffer-visiting parent-file)))
+       (kill-buffer buffer))
+     (with-temp-file parent-file
+       (insert "* Parent\n:PROPERTIES:\n:ID: parent-id\n:END:\n"
+               "** Existing\n*** Target\n*** Target\n"))
+     (should-error
+      (funcall prepare "Ambiguous" '("Existing" "Target"))
+      :type 'user-error))))
 
 (ert-deftest org-roam-agent-prepare-capture-abort-leaves-no-provenance-archive ()
   (org-roam-agent-test--with-child-capture
@@ -489,6 +590,14 @@ TRANSCRIPT.  PREPARE starts another capture from the same transcript."
                    "s" nil transcript project)))
           (let ((archive (alist-get 'provenance_file result)))
             (should (equal (alist-get 'mode result) "new-file"))
+            (should (stringp (alist-get 'section_node_id result)))
+            (should-not (equal (alist-get 'node_id result)
+                               (alist-get 'section_node_id result)))
+            (should (string-match-p
+                     (regexp-quote
+                      (format ":ID: %s"
+                              (alist-get 'section_node_id result)))
+                     (buffer-string)))
             (should (string-match-p
                      ":SOURCE_TRANSCRIPT: \\[\\[file:\.\./provenance/agent-shell/"
                      (buffer-string)))

@@ -84,8 +84,8 @@
 (defconst org-roam-agent-provenance-directory "provenance/agent-shell"
   "Directory beneath `org-roam-directory' for archived transcript snapshots.")
 
-(defvar org-roam-agent--child-parent-id nil
-  "ID of the parent for the active child-node capture.")
+(defvar org-roam-agent--child-parent-locator nil
+  "Parent ID and relative outline path for the active child capture.")
 
 (defvar org-roam-agent--capture-requests (make-hash-table :test #'equal)
   "Lifecycle records for recent agent capture requests.")
@@ -863,6 +863,99 @@ modify files or existing buffers."
 MAX-CHARACTERS has the same meaning as in `org-roam-agent-context'."
   (json-encode (org-roam-agent-context file line max-characters)))
 
+(defun org-roam-agent--outline-anchor (parent-id)
+  "Locate PARENT-ID in the current Org buffer and return its anchor data."
+  (org-with-wide-buffer
+   (let ((position (org-find-entry-with-id parent-id)))
+     (unless position
+       (user-error "Parent ID %s is not present in %s"
+                   parent-id (or buffer-file-name (buffer-name))))
+     (goto-char position)
+     (if (org-before-first-heading-p)
+         (list :id parent-id :position (point) :file-anchor t :path nil)
+       (org-back-to-heading t)
+       (list :id parent-id :position (point) :file-anchor nil
+             :path (org-get-outline-path t))))))
+
+(defun org-roam-agent--map-descendant-headings (anchor function)
+  "Call FUNCTION at each heading beneath ANCHOR.
+
+FUNCTION receives the heading's outline path relative to ANCHOR."
+  (let* ((file-anchor (plist-get anchor :file-anchor))
+         (anchor-path (plist-get anchor :path))
+         (anchor-depth (length anchor-path)))
+    (save-excursion
+      (save-restriction
+        (widen)
+        (goto-char (plist-get anchor :position))
+        (unless file-anchor
+          (org-narrow-to-subtree))
+        (org-map-entries
+         (lambda ()
+           (let ((path (org-get-outline-path t)))
+             (when (and (> (length path) anchor-depth)
+                        (equal (seq-take path anchor-depth) anchor-path))
+               (funcall function (seq-drop path anchor-depth)))))
+         nil (if file-anchor 'file 'tree))))))
+
+(defun org-roam-agent--heading-result (relative-path)
+  "Return the heading at point with RELATIVE-PATH."
+  `((title . ,(org-get-heading t t t t))
+    (outline_path . ,(vconcat relative-path))
+    (level . ,(org-outline-level))
+    (line . ,(line-number-at-pos))
+    (id . ,(org-entry-get nil "ID"))))
+
+(defun org-roam-agent--headings-in-current-buffer (parent-id)
+  "Return heading records beneath PARENT-ID in the current Org buffer."
+  (let ((anchor (org-roam-agent--outline-anchor parent-id))
+        (results nil))
+    (org-roam-agent--map-descendant-headings
+     anchor
+     (lambda (relative-path)
+       (push (org-roam-agent--heading-result relative-path) results)))
+    (vconcat (nreverse results))))
+
+;;;###autoload
+(defun org-roam-agent-headings (parent-id)
+  "Return headings beneath the Org-roam node identified by PARENT-ID.
+
+Outline paths are relative to the anchor node.  A file node therefore returns
+all headings in the file, while a heading node returns only its descendants."
+  (unless (require 'org-roam nil t)
+    (user-error "Org-roam is not available in this Emacs instance"))
+  (setq parent-id
+        (org-roam-agent--capture-single-line parent-id "Parent ID"))
+  (let* ((node (or (org-roam-node-from-id parent-id)
+                   (user-error "No Org-roam node with ID %s" parent-id)))
+         (file (file-truename (org-roam-node-file node)))
+         (live-buffer (org-roam-agent--buffer-visiting-file file))
+         (source (if live-buffer "buffer" "disk"))
+         (modified (and live-buffer (buffer-modified-p live-buffer)))
+         headings)
+    (if live-buffer
+        (with-current-buffer live-buffer
+          (setq headings
+                (org-roam-agent--headings-in-current-buffer parent-id)))
+      (with-temp-buffer
+        (insert-file-contents file)
+        (setq buffer-file-name file)
+        (org-mode)
+        (setq headings
+              (org-roam-agent--headings-in-current-buffer parent-id))))
+    `((parent . ((id . ,parent-id)
+                 (title . ,(org-roam-node-title node))
+                 (file . ,file)
+                 (level . ,(org-roam-node-level node))))
+      (source . ,source)
+      (buffer_modified . ,(if modified t :json-false))
+      (headings . ,headings))))
+
+;;;###autoload
+(defun org-roam-agent-headings-json (parent-id)
+  "Return headings beneath PARENT-ID as JSON."
+  (json-encode (org-roam-agent-headings parent-id)))
+
 (defun org-roam-agent--capture-single-line (value label)
   "Validate VALUE as a non-empty single line identified by LABEL."
   (unless (stringp value)
@@ -1180,15 +1273,31 @@ that ID."
 
 (defun org-roam-agent--goto-child-capture-parent ()
   "Move to the parent node for an active child-node capture."
-  (unless org-roam-agent--child-parent-id
-    (user-error "Child capture has no parent ID"))
-  (let ((position
-         (org-find-entry-with-id org-roam-agent--child-parent-id)))
-    (unless position
-      (user-error "Parent ID %s is not present in %s"
-                  org-roam-agent--child-parent-id
-                  (or buffer-file-name (buffer-name))))
-    (goto-char position)))
+  (unless org-roam-agent--child-parent-locator
+    (user-error "Child capture has no parent locator"))
+  (let* ((parent-id (plist-get org-roam-agent--child-parent-locator :id))
+         (parent-headings
+          (plist-get org-roam-agent--child-parent-locator :headings))
+         (anchor (org-roam-agent--outline-anchor parent-id))
+         (file-anchor (plist-get anchor :file-anchor)))
+    (goto-char (plist-get anchor :position))
+    (if (null parent-headings)
+        (if file-anchor
+            (goto-char (point-max))
+          (org-back-to-heading t))
+      (let ((matches nil))
+        (org-roam-agent--map-descendant-headings
+         anchor
+         (lambda (relative-path)
+           (when (equal relative-path parent-headings)
+             (push (point-marker) matches))))
+        (unless (= (length matches) 1)
+          (mapc (lambda (marker) (set-marker marker nil)) matches)
+          (user-error
+           "Relative parent heading path %S matched %d headings beneath %s"
+           parent-headings (length matches) parent-id))
+        (goto-char (car matches))
+        (mapc (lambda (marker) (set-marker marker nil)) matches)))))
 
 (defun org-roam-agent--capture-timestamp ()
   "Return the current time in a stable machine-readable format."
@@ -1295,11 +1404,12 @@ selects one of the configured Org-roam capture templates."
   (unless (require 'org-roam-capture nil t)
     (user-error "Org-roam capture is not available in this Emacs instance"))
   (let* ((id (org-id-new))
+         (section-id (org-id-new))
          (node (org-roam-node-create :id id :title title))
          (section (org-roam-agent--agent-heading
                    1 section-title body
                    (org-roam-agent--provenance-placeholder request-id)
-                   (alist-get 'session_id provenance)))
+                   (alist-get 'session_id provenance) section-id))
          (template (org-roam-agent--new-file-template
                     template-key section)))
     (org-roam-capture- :keys template-key
@@ -1314,11 +1424,12 @@ selects one of the configured Org-roam capture templates."
        `((status . "prepared")
          (mode . "new-file")
          (node_id . ,id)
+         (section_node_id . ,section-id)
          (title . ,title)
          (template . ,template-key))))))
 
 (defun org-roam-agent--prepare-child-capture
-    (title body provenance parent-id request-id)
+    (title body provenance parent-id request-id parent-headings)
   "Prepare a child heading node capture and return a JSON-ready result.
 
 TITLE and BODY form the new node beneath PARENT-ID.  PROVENANCE describes the
@@ -1327,7 +1438,8 @@ staged source snapshot."
                      (user-error "No Org-roam parent node with ID %s"
                                  parent-id)))
          (parent-file (org-roam-node-file parent))
-         (org-roam-agent--child-parent-id parent-id)
+         (org-roam-agent--child-parent-locator
+          (list :id parent-id :headings parent-headings))
          (id (org-id-new))
          (key "A")
          (content (org-roam-agent--agent-heading
@@ -1353,14 +1465,16 @@ staged source snapshot."
      `((status . "prepared")
        (mode . "child-node")
        (node_id . ,id)
+       (section_node_id . ,id)
        (title . ,title)
-       (parent_id . ,parent-id)))))
+       (parent_id . ,parent-id)
+       (parent_headings . ,(vconcat parent-headings))))))
 
 ;;;###autoload
 (defun org-roam-agent-prepare-capture
     (title section-title body-file session-id
            &optional template-key parent-id transcript-file
-           invocation-directory)
+           invocation-directory parent-headings)
   "Prepare an interactive agent-authored Org capture.
 
 Create a new file node when PARENT-ID is nil.  Otherwise prepare a new child
@@ -1371,13 +1485,21 @@ provenance.  When TRANSCRIPT-FILE is non-nil, it explicitly selects a
 transcript beneath an Agent Shell transcript directory and must belong to
 SESSION-ID.  INVOCATION-DIRECTORY identifies the project from which the
 command was run for automatic stored-transcript lookup.  TEMPLATE-KEY defaults
-to `org-roam-agent-default-capture-template'.  This function never finalizes
+to `org-roam-agent-default-capture-template'.  PARENT-HEADINGS is a relative
+outline path beneath PARENT-ID.  This function never finalizes
 the capture; the user must explicitly finalize or abort it in Emacs."
   (unless (require 'org-roam nil t)
     (user-error "Org-roam is not available in this Emacs instance"))
   (setq title (org-roam-agent--capture-single-line title "Title")
         session-id (org-roam-agent--capture-single-line
                     session-id "Session ID"))
+  (unless (or (null parent-headings) parent-id)
+    (user-error "Parent headings require a parent ID"))
+  (setq parent-headings
+        (mapcar (lambda (heading)
+                  (org-roam-agent--capture-single-line
+                   heading "Parent heading"))
+                parent-headings))
   (let* ((body (org-roam-agent--read-capture-body body-file))
          (transcript
          (if transcript-file
@@ -1395,7 +1517,7 @@ the capture; the user must explicitly finalize or abort it in Emacs."
                 (org-roam-agent--prepare-child-capture
                  title body provenance
                  (org-roam-agent--capture-single-line parent-id "Parent ID")
-                 request-id)
+                 request-id parent-headings)
               (org-roam-agent--prepare-new-file-capture
                title
                (org-roam-agent--capture-single-line
@@ -1411,16 +1533,16 @@ the capture; the user must explicitly finalize or abort it in Emacs."
 (defun org-roam-agent-prepare-capture-json
     (title section-title body-file session-id
            &optional template-key parent-id transcript-file
-           invocation-directory)
+           invocation-directory parent-headings)
   "Return JSON for an interactive agent-authored Org capture.
 
 TITLE, SECTION-TITLE, BODY-FILE, SESSION-ID, TEMPLATE-KEY, PARENT-ID,
-TRANSCRIPT-FILE, and INVOCATION-DIRECTORY have the same meanings as in
-`org-roam-agent-prepare-capture'."
+TRANSCRIPT-FILE, INVOCATION-DIRECTORY, and PARENT-HEADINGS have the same
+meanings as in `org-roam-agent-prepare-capture'."
   (json-encode
    (org-roam-agent-prepare-capture
     title section-title body-file session-id template-key parent-id
-    transcript-file invocation-directory)))
+    transcript-file invocation-directory parent-headings)))
 
 (provide 'org-roam-agent)
 

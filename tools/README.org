@@ -102,6 +102,23 @@ Org-roam database and sets =database_may_omit_unsaved= to make clear that
 unsaved buffer changes may not be represented. The command neither saves
 buffers nor rebuilds the database.
 
+* List headings beneath a node
+
+#+begin_src sh
+org-roam-agent headings --parent-id "PARENT-NODE-ID"
+#+end_src
+
+This read-only command lists Org headings below a file node or heading node.
+Each result includes its title, absolute Org heading level, line, optional ID,
+and =outline_path=. The outline path is relative to the selected node, so it
+can identify descendants that do not have IDs of their own. A file-node anchor
+lists the whole file outline; a heading-node anchor lists only descendants and
+does not repeat the anchor itself.
+
+Like =context=, the command reads a live visiting buffer when one exists and
+reports =source= and =buffer_modified=. It does not save the buffer. Capture
+still rejects a target file with unsaved changes.
+
 * Capture capabilities
 
 #+begin_src sh
@@ -150,6 +167,7 @@ new section of this form:
 #+begin_example
 * Observation :agent:
 :PROPERTIES:
+:ID: ...
 :SOURCE_SESSION_ID: ...
 :SOURCE_TRANSCRIPT: [[file:../../provenance/agent-shell/.../snapshot.md][agent-shell session ...]]
 :END:
@@ -162,6 +180,8 @@ filename, and header. The command does not change the configured template.
 Any real Org headings in the supplied body are nested beneath the generated
 agent-authored section, so its provenance covers the complete body.
 Heading-like text inside source and example blocks is preserved literally.
+The file node and the generated agent section receive distinct IDs. The JSON
+result returns them as =node_id= and =section_node_id= respectively.
 
 * Prepare a child heading node
 
@@ -175,7 +195,31 @@ org-roam-agent prepare-capture \
   --parent-id "PARENT-NODE-ID"
 #+end_src
 
-The new child heading receives its own ID, the =:agent:= tag, and the same
+The parent ID may identify either a heading node or a file node. With no
+further locator, capture creates a child below a heading node or a new
+top-level section at the end of a file node.
+
+To place the new agent node beneath an ID-less descendant, first inspect the
+relative outline:
+
+#+begin_src sh
+org-roam-agent headings --parent-id "PARENT-NODE-ID"
+
+org-roam-agent prepare-capture \
+  --title "New observation" \
+  --body-file /tmp/org-roam-agent-draft.org \
+  --parent-id "PARENT-NODE-ID" \
+  --parent-heading "Design" \
+  --parent-heading "Sandboxing"
+#+end_src
+
+Each repeated =--parent-heading= is one component of the relative path. The
+helper resolves the path with Org outline APIs when capture begins and rejects
+missing or duplicate matches rather than guessing. The path cannot escape the
+anchor subtree.
+
+The new child heading receives its own ID, returned as both =node_id= and
+=section_node_id=, the =:agent:= tag, and the same
 =SOURCE_SESSION_ID= and =SOURCE_TRANSCRIPT= provenance. Existing content is
 not rewritten. To avoid saving unrelated edits when the user finalizes the
 capture, the command rejects a parent file that already has unsaved buffer

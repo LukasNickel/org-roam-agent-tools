@@ -63,6 +63,7 @@ prefix_rule(
             "search-text",
             "context",
             "links",
+            "headings",
             "capture-status",
             "prepare-capture",
         ],

@@ -16,12 +16,13 @@ save note files directly with filesystem tools, shell commands, `emacsclient`,
 or editor automation. A user's request to add to or update an existing note
 does not relax this boundary.
 
-Represent an additive update as a child-node capture when the intended parent
-has a stable Org-roam ID. If the request requires changing, moving, deleting,
-or regrouping existing text, or if the intended placement is not an
-addressable node, stop and explain that the current interface does not support
-the mutation. Do not silently target a broader node or fall back to direct
-editing.
+Represent an additive update as a child-node capture anchored by a stable
+Org-roam ID. The anchor may be a file node or heading node. An ID-less
+descendant remains addressable through its relative outline path, discovered
+with `headings` and supplied as repeated `--parent-heading` arguments. If the
+request requires changing, moving, deleting, or regrouping existing text,
+stop and explain that the current interface does not support the mutation. Do
+not silently target a broader node or fall back to direct editing.
 
 ## Suggest capture selectively
 
@@ -66,6 +67,12 @@ inspect explicit backlinks and outgoing neighbors. Use semantic search to find
 additional related notes when the graph neighborhood is sparse. Include only
 relationships that remain clear after bounded context inspection.
 
+When placement below a particular existing section matters, call `headings`
+with `--parent-id ID` and select the complete relative `outline_path` from its
+JSON result. Do not derive the path by parsing the Org file. If the desired
+heading is absent or its path is ambiguous, resolve that with the user before
+capture.
+
 Choose a new file node for a distinct concept. Choose a child node when the new
 content clearly belongs beneath an existing node. Add a small set of confident
 Org ID links to related nodes, inline when they support a sentence or in a short
@@ -85,7 +92,8 @@ a sibling node in the same body.
 Present the complete proposal before preparing it:
 
 - mode: new file node or child node;
-- parent title and stable ID for a child node;
+- parent title and stable anchor ID for a child node, plus the relative heading
+  path when targeting an ID-less descendant;
 - node title and, for a new file, section title;
 - template key, description, configured purpose, and destination for a new
   file, explicitly identifying whether it is the configured default and any
@@ -112,10 +120,13 @@ environment ID is missing, ask the user to copy the current buffer's ID with
 `agent-shell-copy-session-id` and pass that value explicitly.
 
 For a new file node, pass the confirmed title, section title, body file, and
-template. For a child node, pass the confirmed title, body file, and parent ID;
-do not pass a section title or template.
+template. For a child node, pass the confirmed title, body file, and parent ID.
+When a relative outline path was confirmed, pass one `--parent-heading` per
+path component in order. Do not pass a section title or template for a child
+node.
 
-The helper adds the `:agent:` tag, the stable `SOURCE_SESSION_ID`, and a
+The helper gives every new agent section its own Org ID and adds the `:agent:`
+tag, the stable `SOURCE_SESSION_ID`, and a
 portable relative `SOURCE_TRANSCRIPT` link. It stages an immutable transcript
 snapshot during preparation but archives it beneath the Org-roam directory
 only when the user finalizes. Preserve the returned `request_id`. A result with

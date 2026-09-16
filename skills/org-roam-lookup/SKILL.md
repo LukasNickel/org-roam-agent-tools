@@ -15,9 +15,10 @@ commands, `apply_patch`, `emacsclient`, or editor automation. Lookup may
 locate and inspect the intended note, but it must remain read-only.
 
 Route a purely additive request to `org-roam-capture`, which can create a new
-child node with its own provenance. Changing, moving, deleting, or regrouping
-existing text is outside the current interfaces; state that limitation instead
-of improvising a direct edit.
+child node with its own provenance beneath either an ID-bearing node or an
+ID-less descendant selected by an Org-derived relative outline path. Changing,
+moving, deleting, or regrouping existing text is outside the current
+interfaces; state that limitation instead of improvising a direct edit.
 
 ## Locate the interface
 
