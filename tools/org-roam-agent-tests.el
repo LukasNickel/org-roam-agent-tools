@@ -310,7 +310,9 @@ TRANSCRIPT.  PREPARE starts another capture from the same transcript."
                     "**Session ID:** session-123\n\n"
                     "Durable discussion.\n"))
           (with-temp-file body-file
-            (insert "Captured conclusion.\n"))
+            (insert "Captured conclusion.\n"
+                    "\n* Nested detail\n"
+                    "\nNested content.\n"))
           (with-temp-file parent-file
             (insert "* Parent\n:PROPERTIES:\n:ID: parent-id\n:END:\n"))
           (cl-labels
@@ -357,6 +359,8 @@ TRANSCRIPT.  PREPARE starts another capture from the same transcript."
        (should (string-match-p
                 ":SOURCE_TRANSCRIPT: \\[\\[file:\.\./provenance/agent-shell/"
                 (buffer-string)))
+       (should (string-match-p "^\\*\\*\\* Nested detail$"
+                               (buffer-string)))
        (org-capture-kill)
        (should-not (file-exists-p archive))
        (should
@@ -456,7 +460,12 @@ TRANSCRIPT.  PREPARE starts another capture from the same transcript."
                     "**Session ID:** session-123\n\n"
                     "Durable discussion.\n"))
           (with-temp-file body-file
-            (insert "Captured conclusion.\n"))
+            (insert "Captured conclusion.\n"
+                    "\n* Nested topic\n"
+                    "\nNested content.\n"
+                    "\n#+begin_src org\n"
+                    "* Example headline\n"
+                    "#+end_src\n"))
           (cl-letf
               (((symbol-function 'require)
                 (lambda (feature &optional filename noerror)
@@ -483,6 +492,10 @@ TRANSCRIPT.  PREPARE starts another capture from the same transcript."
             (should (string-match-p
                      ":SOURCE_TRANSCRIPT: \\[\\[file:\.\./provenance/agent-shell/"
                      (buffer-string)))
+            (should (string-match-p "^\\*\\* Nested topic$"
+                                    (buffer-string)))
+            (should (string-match-p "^\\* Example headline$"
+                                    (buffer-string)))
             (org-capture-finalize)
             (should (file-exists-p archive))
             (with-temp-buffer

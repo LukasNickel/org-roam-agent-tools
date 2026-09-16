@@ -8,6 +8,21 @@ description: Capture durable findings and decisions as new agent-authored Org-ro
 Create only new content through the interactive Org-roam capture interface in
 the user's running Emacs session. Existing note text remains unchanged.
 
+## Enforce the mutation boundary
+
+All Org-roam note mutations in this skill go through the installed
+`org-roam-agent prepare-capture` interface. Never write, patch, restructure, or
+save note files directly with filesystem tools, shell commands, `emacsclient`,
+or editor automation. A user's request to add to or update an existing note
+does not relax this boundary.
+
+Represent an additive update as a child-node capture when the intended parent
+has a stable Org-roam ID. If the request requires changing, moving, deleting,
+or regrouping existing text, or if the intended placement is not an
+addressable node, stop and explain that the current interface does not support
+the mutation. Do not silently target a broader node or fall back to direct
+editing.
+
 ## Suggest capture selectively
 
 Suggest capture at a natural conclusion when the discussion produced a durable,
@@ -60,6 +75,12 @@ Write a concise synthesis of the durable findings, important rationale, and
 caveats. Make the note understandable without the conversation. Omit discussion
 chronology, repetition, abandoned alternatives, and close imitation of the
 user's wording unless exact wording matters.
+
+Each capture creates one provenance-bearing agent node. Body headings are
+automatically nested beneath that node, while headline-looking text inside
+source and example blocks is preserved. Keep one independently sourced
+addition per capture; use another child-node capture rather than trying to add
+a sibling node in the same body.
 
 Present the complete proposal before preparing it:
 

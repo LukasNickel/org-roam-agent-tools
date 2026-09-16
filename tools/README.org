@@ -7,6 +7,9 @@ Org-roam instance. Retrieval operations are read-only. Capture operations open
 an interactive capture and require the user to finalize it. The Emacs Lisp
 helper is loaded into the running Emacs server, so the user's existing
 Org-roam directory, templates, and database settings remain authoritative.
+The supported mutation boundary is deliberately narrow: agents may create new
+file or child nodes through =prepare-capture=, but may not rewrite, move,
+delete, or directly patch existing note text.
 
 * Search nodes
 
@@ -156,6 +159,9 @@ Draft text
 
 The configured template continues to control the new file's directory,
 filename, and header. The command does not change the configured template.
+Any real Org headings in the supplied body are nested beneath the generated
+agent-authored section, so its provenance covers the complete body.
+Heading-like text inside source and example blocks is preserved literally.
 
 * Prepare a child heading node
 

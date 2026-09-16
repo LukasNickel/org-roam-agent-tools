@@ -7,6 +7,18 @@ description: Look up existing knowledge in the user's Org-roam notes when they a
 
 Answer from the user's existing Org-roam collection without changing it.
 
+## Preserve the read-only boundary
+
+Do not interpret a request to add, update, correct, reorganize, or delete note
+content as permission to mutate the Org tree through filesystem tools, shell
+commands, `apply_patch`, `emacsclient`, or editor automation. Lookup may
+locate and inspect the intended note, but it must remain read-only.
+
+Route a purely additive request to `org-roam-capture`, which can create a new
+child node with its own provenance. Changing, moving, deleting, or regrouping
+existing text is outside the current interfaces; state that limitation instead
+of improvising a direct edit.
+
 ## Locate the interface
 
 Resolve `org-roam-agent` from `PATH` with `command -v`. Use the exact absolute
